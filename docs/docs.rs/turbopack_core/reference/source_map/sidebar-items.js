@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":[["SourceMapReference",""],["SourceMapReferenceVc","Vc for [`SourceMapReference`]"]],"type":[["SourceMapReferenceReadRef","see [turbo_tasks::ReadRef]"]]};
