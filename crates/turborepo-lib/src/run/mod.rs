@@ -31,7 +31,7 @@ use turborepo_env::EnvironmentVariableMap;
 use turborepo_repository::package_graph::{PackageGraph, PackageName, PackageNode};
 use turborepo_scm::SCM;
 use turborepo_telemetry::events::generic::GenericEventBuilder;
-use turborepo_ui::{cprint, cprintln, tui, tui::AppSender, BOLD_GREY, GREY, UI};
+use turborepo_ui::{cprint, cprintln, tui, tui::AppSender, ColorConfig, BOLD_GREY, GREY};
 
 pub use crate::run::error::Error;
 use crate::{
@@ -43,14 +43,14 @@ use crate::{
     signal::SignalHandler,
     task_graph::Visitor,
     task_hash::{get_external_deps_hash, get_internal_deps_hash, PackageInputsHashes},
-    turbo_json::TurboJson,
+    turbo_json::{TurboJson, UIMode},
     DaemonClient, DaemonConnector,
 };
 
 #[derive(Clone)]
 pub struct Run {
     version: &'static str,
-    ui: UI,
+    color_config: ColorConfig,
     start_at: DateTime<Local>,
     processes: ProcessManager,
     run_telemetry: GenericEventBuilder,
@@ -69,7 +69,7 @@ pub struct Run {
     task_access: TaskAccess,
     daemon: Option<DaemonClient<DaemonConnector>>,
     should_print_prelude: bool,
-    experimental_ui: bool,
+    ui_mode: UIMode,
 }
 
 impl Run {
@@ -79,8 +79,8 @@ impl Run {
     fn print_run_prelude(&self) {
         let targets_list = self.opts.run_opts.tasks.join(", ");
         if self.opts.run_opts.single_package {
-            cprint!(self.ui, GREY, "{}", "• Running");
-            cprint!(self.ui, BOLD_GREY, " {}\n", targets_list);
+            cprint!(self.color_config, GREY, "{}", "• Running");
+            cprint!(self.color_config, BOLD_GREY, " {}\n", targets_list);
         } else {
             let mut packages = self
                 .filtered_pkgs
@@ -89,21 +89,26 @@ impl Run {
                 .collect::<Vec<String>>();
             packages.sort();
             cprintln!(
-                self.ui,
+                self.color_config,
                 GREY,
                 "• Packages in scope: {}",
                 packages.join(", ")
             );
-            cprint!(self.ui, GREY, "{} ", "• Running");
-            cprint!(self.ui, BOLD_GREY, "{}", targets_list);
-            cprint!(self.ui, GREY, " in {} packages\n", self.filtered_pkgs.len());
+            cprint!(self.color_config, GREY, "{} ", "• Running");
+            cprint!(self.color_config, BOLD_GREY, "{}", targets_list);
+            cprint!(
+                self.color_config,
+                GREY,
+                " in {} packages\n",
+                self.filtered_pkgs.len()
+            );
         }
 
         let use_http_cache = !self.opts.cache_opts.skip_remote;
         if use_http_cache {
-            cprintln!(self.ui, GREY, "• Remote caching enabled");
+            cprintln!(self.color_config, GREY, "• Remote caching enabled");
         } else {
-            cprintln!(self.ui, GREY, "• Remote caching disabled");
+            cprintln!(self.color_config, GREY, "• Remote caching disabled");
         }
     }
 
@@ -168,16 +173,16 @@ impl Run {
         &self.filtered_pkgs
     }
 
-    pub fn ui(&self) -> UI {
-        self.ui
+    pub fn color_config(&self) -> ColorConfig {
+        self.color_config
     }
 
-    pub fn has_experimental_ui(&self) -> bool {
-        self.experimental_ui
+    pub fn has_tui(&self) -> bool {
+        self.ui_mode.use_tui()
     }
 
     pub fn should_start_ui(&self) -> Result<bool, Error> {
-        Ok(self.experimental_ui
+        Ok(self.ui_mode.use_tui()
             && self.opts.run_opts.dry_run.is_none()
             && tui::terminal_big_enough()?)
     }
@@ -207,14 +212,26 @@ impl Run {
         Ok(Some((sender, handle)))
     }
 
+    /// Returns a handle that can be used to stop a run
+    pub fn stopper(&self) -> RunStopper {
+        RunStopper {
+            manager: self.processes.clone(),
+        }
+    }
+
     pub async fn run(
         &mut self,
         experimental_ui_sender: Option<AppSender>,
         is_watch: bool,
     ) -> Result<i32, Error> {
+        let skip_cache_writes = self.opts.runcache_opts.skip_writes;
         if let Some(subscriber) = self.signal_handler.subscribe() {
             let run_cache = self.run_cache.clone();
             tokio::spawn(async move {
+                // Cache writes are disabled, can skip setting up cache write listener
+                if skip_cache_writes {
+                    return;
+                }
                 let _guard = subscriber.listen().await;
                 let spinner = turborepo_ui::start_spinner("...Finishing writing to cache...");
                 if let Ok((status, closed)) = run_cache.shutdown_cache().await {
@@ -283,7 +300,7 @@ impl Run {
 
         if let Some(graph_opts) = &self.opts.run_opts.graph {
             graph_visualizer::write_graph(
-                self.ui,
+                self.color_config,
                 graph_opts,
                 &self.engine,
                 self.opts.run_opts.single_package,
@@ -389,7 +406,7 @@ impl Run {
             &self.env_at_execution_start,
             &global_hash,
             self.opts.run_opts.env_mode,
-            self.ui,
+            self.color_config,
             self.processes.clone(),
             &self.repo_root,
             global_env,
@@ -437,5 +454,16 @@ impl Run {
             .await?;
 
         Ok(exit_code)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RunStopper {
+    manager: ProcessManager,
+}
+
+impl RunStopper {
+    pub async fn stop(&self) {
+        self.manager.stop().await;
     }
 }

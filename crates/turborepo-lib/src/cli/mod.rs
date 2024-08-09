@@ -8,7 +8,7 @@ use clap::{
 };
 use clap_complete::{generate, Shell};
 pub use error::Error;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, error, log::warn};
 use turbopath::AbsoluteSystemPathBuf;
 use turborepo_api_client::AnonAPIClient;
@@ -17,7 +17,7 @@ use turborepo_telemetry::{
     events::{command::CommandEventBuilder, generic::GenericEventBuilder, EventBuilder, EventType},
     init_telemetry, track_usage, TelemetryHandle,
 };
-use turborepo_ui::{GREY, UI};
+use turborepo_ui::{ColorConfig, GREY};
 
 use crate::{
     cli::error::print_potential_tasks,
@@ -29,7 +29,7 @@ use crate::{
     run::watch::WatchClient,
     shim::TurboState,
     tracing::TurboSubscriber,
-    turbo_json::UI as ConfigUI,
+    turbo_json::UIMode,
 };
 
 mod error;
@@ -136,7 +136,9 @@ impl Display for DryRunMode {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Serialize, ValueEnum)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Serialize, ValueEnum, Deserialize, Eq, Deserializable,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum EnvMode {
     Loose,
@@ -183,7 +185,7 @@ pub struct Args {
     pub heap: Option<String>,
     /// Specify whether to use the streaming UI or TUI
     #[clap(long, global = true, value_enum)]
-    pub ui: Option<ConfigUI>,
+    pub ui: Option<UIMode>,
     /// Override the login endpoint
     #[clap(long, global = true, value_parser)]
     pub login: Option<String>,
@@ -492,6 +494,10 @@ pub enum Command {
     Config,
     /// EXPERIMENTAL: List packages in your monorepo.
     Ls {
+        /// Show only packages that are affected by changes between
+        /// the current branch and `main`
+        #[clap(long, group = "scope-filter-group")]
+        affected: bool,
         /// Use the given selector to specify package(s) to act as
         /// entry points. The syntax mirrors pnpm's syntax, and
         /// additional documentation and examples can be found in
@@ -694,6 +700,11 @@ pub struct ExecutionArgs {
     /// turbo's documentation https://turbo.build/repo/docs/reference/command-line-reference/run#--filter
     #[clap(short = 'F', long, group = "scope-filter-group")]
     pub filter: Vec<String>,
+
+    /// Run only tasks that are affected by changes between
+    /// the current branch and `main`
+    #[clap(long, group = "scope-filter-group")]
+    pub affected: bool,
 
     /// Set type of process output logging. Use "full" to show
     /// all output. Use "hash-only" to show only turbo-computed
@@ -955,14 +966,15 @@ impl Display for LogPrefix {
 /// local turbo, such as in the case where `TURBO_BINARY_PATH` is set,
 /// we use it here to modify clap's arguments.
 /// * `logger`: The logger to use for the run.
-/// * `ui`: The UI to use for the run.
+/// * `color_config`: The color configuration to use for the run, i.e. whether
+///   we should colorize output.
 ///
 /// returns: Result<Payload, Error>
 #[tokio::main]
 pub async fn run(
     repo_state: Option<RepoState>,
     #[allow(unused_variables)] logger: &TurboSubscriber,
-    ui: UI,
+    color_config: ColorConfig,
 ) -> Result<i32, Error> {
     // TODO: remove mutability from this function
     let mut cli_args = Args::new();
@@ -974,7 +986,7 @@ pub async fn run(
     // initialize telemetry
     match AnonAPIClient::new("https://telemetry.vercel.com", 250, version) {
         Ok(anonymous_api_client) => {
-            let handle = init_telemetry(anonymous_api_client, ui);
+            let handle = init_telemetry(anonymous_api_client, color_config);
             match handle {
                 Ok(h) => telemetry_handle = Some(h),
                 Err(error) => {
@@ -1098,7 +1110,7 @@ pub async fn run(
             CommandEventBuilder::new("daemon")
                 .with_parent(&root_telemetry)
                 .track_call();
-            let base = CommandBase::new(cli_args.clone(), repo_root, version, ui);
+            let base = CommandBase::new(cli_args.clone(), repo_root, version, color_config);
 
             match command {
                 Some(command) => daemon::daemon_client(command, &base).await,
@@ -1131,13 +1143,13 @@ pub async fn run(
         Command::Telemetry { command } => {
             let event = CommandEventBuilder::new("telemetry").with_parent(&root_telemetry);
             event.track_call();
-            let mut base = CommandBase::new(cli_args.clone(), repo_root, version, ui);
+            let mut base = CommandBase::new(cli_args.clone(), repo_root, version, color_config);
             let child_event = event.child();
             telemetry::configure(command, &mut base, child_event);
             Ok(0)
         }
         Command::Scan {} => {
-            let base = CommandBase::new(cli_args.clone(), repo_root, version, ui);
+            let base = CommandBase::new(cli_args.clone(), repo_root, version, color_config);
             if scan::run(base).await {
                 Ok(0)
             } else {
@@ -1145,19 +1157,24 @@ pub async fn run(
             }
         }
         Command::Config => {
-            let base = CommandBase::new(cli_args.clone(), repo_root, version, ui);
+            let base = CommandBase::new(cli_args.clone(), repo_root, version, color_config);
             config::run(base).await?;
             Ok(0)
         }
-        Command::Ls { filter, packages } => {
+        Command::Ls {
+            affected,
+            filter,
+            packages,
+        } => {
             warn!("ls command is experimental and may change in the future");
             let event = CommandEventBuilder::new("info").with_parent(&root_telemetry);
 
             event.track_call();
+            let affected = *affected;
             let filter = filter.clone();
             let packages = packages.clone();
-            let base = CommandBase::new(cli_args, repo_root, version, ui);
-            ls::run(base, packages, event, filter).await?;
+            let base = CommandBase::new(cli_args, repo_root, version, color_config);
+            ls::run(base, packages, event, filter, affected).await?;
 
             Ok(0)
         }
@@ -1175,7 +1192,7 @@ pub async fn run(
 
             let modify_gitignore = !*no_gitignore;
             let to = *target;
-            let mut base = CommandBase::new(cli_args, repo_root, version, ui);
+            let mut base = CommandBase::new(cli_args, repo_root, version, color_config);
 
             if let Err(err) = link::link(&mut base, modify_gitignore, to).await {
                 error!("error: {}", err.to_string())
@@ -1188,7 +1205,7 @@ pub async fn run(
             event.track_call();
             let invalidate = *invalidate;
 
-            let mut base = CommandBase::new(cli_args, repo_root, version, ui);
+            let mut base = CommandBase::new(cli_args, repo_root, version, color_config);
             let event_child = event.child();
 
             logout::logout(&mut base, invalidate, event_child).await?;
@@ -1206,7 +1223,7 @@ pub async fn run(
             let sso_team = sso_team.clone();
             let force = *force;
 
-            let mut base = CommandBase::new(cli_args, repo_root, version, ui);
+            let mut base = CommandBase::new(cli_args, repo_root, version, color_config);
             let event_child = event.child();
 
             if let Some(sso_team) = sso_team {
@@ -1227,7 +1244,7 @@ pub async fn run(
             }
 
             let from = *target;
-            let mut base = CommandBase::new(cli_args, repo_root, version, ui);
+            let mut base = CommandBase::new(cli_args, repo_root, version, color_config);
 
             unlink::unlink(&mut base, from)?;
 
@@ -1240,7 +1257,7 @@ pub async fn run(
             let event = CommandEventBuilder::new("run").with_parent(&root_telemetry);
             event.track_call();
 
-            let base = CommandBase::new(cli_args.clone(), repo_root, version, ui);
+            let base = CommandBase::new(cli_args.clone(), repo_root, version, color_config);
 
             if execution_args.tasks.is_empty() {
                 print_potential_tasks(base, event).await?;
@@ -1263,7 +1280,7 @@ pub async fn run(
         Command::Watch(_) => {
             let event = CommandEventBuilder::new("watch").with_parent(&root_telemetry);
             event.track_call();
-            let base = CommandBase::new(cli_args, repo_root, version, ui);
+            let base = CommandBase::new(cli_args, repo_root, version, color_config);
 
             let mut client = WatchClient::new(base, event).await?;
             client.start().await?;
@@ -1285,7 +1302,7 @@ pub async fn run(
                 .unwrap_or_default();
             let docker = *docker;
             let output_dir = output_dir.clone();
-            let base = CommandBase::new(cli_args, repo_root, version, ui);
+            let base = CommandBase::new(cli_args, repo_root, version, color_config);
             let event_child = event.child();
             prune::prune(&base, &scope, docker, &output_dir, event_child).await?;
             Ok(0)
@@ -1299,11 +1316,6 @@ pub async fn run(
         }
     };
 
-    if cli_result.is_err() {
-        root_telemetry.track_failure();
-    } else {
-        root_telemetry.track_success();
-    }
     root_telemetry.track_end();
     match telemetry_handle {
         Some(handle) => handle.close_with_timeout().await,

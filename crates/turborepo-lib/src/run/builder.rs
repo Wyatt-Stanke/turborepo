@@ -25,7 +25,7 @@ use turborepo_telemetry::events::{
     repo::{RepoEventBuilder, RepoType},
     EventBuilder, TrackedErrors,
 };
-use turborepo_ui::{ColorSelector, UI};
+use turborepo_ui::{ColorConfig, ColorSelector};
 #[cfg(feature = "daemon-package-discovery")]
 use {
     crate::run::package_discovery::DaemonPackageDiscovery,
@@ -45,7 +45,7 @@ use crate::{
     run::{scope, task_access::TaskAccess, task_id::TaskName, Error, Run, RunCache},
     shim::TurboState,
     signal::{SignalHandler, SignalSubscriber},
-    turbo_json::TurboJson,
+    turbo_json::{TurboJson, UIMode},
     DaemonConnector,
 };
 
@@ -54,9 +54,9 @@ pub struct RunBuilder {
     opts: Opts,
     api_auth: Option<APIAuth>,
     repo_root: AbsoluteSystemPathBuf,
-    ui: UI,
+    color_config: ColorConfig,
     version: &'static str,
-    experimental_ui: bool,
+    ui_mode: UIMode,
     api_client: APIClient,
     analytics_sender: Option<AnalyticsSender>,
     // In watch mode, we can have a changed package that we want to serve as an entrypoint.
@@ -77,24 +77,28 @@ impl RunBuilder {
         let allow_missing_package_manager = config.allow_no_package_manager();
 
         let version = base.version();
-        let experimental_ui = config.ui();
+        let ui_mode = config.ui();
         let processes = ProcessManager::new(
             // We currently only use a pty if the following are met:
             // - we're attached to a tty
             atty::is(atty::Stream::Stdout) &&
             // - if we're on windows, we're using the UI
-            (!cfg!(windows) || experimental_ui),
+            (!cfg!(windows) || matches!(ui_mode, UIMode::Tui)),
         );
-        let CommandBase { repo_root, ui, .. } = base;
+        let CommandBase {
+            repo_root,
+            color_config: ui,
+            ..
+        } = base;
 
         Ok(Self {
             processes,
             opts,
             api_client,
             repo_root,
-            ui,
+            color_config: ui,
             version,
-            experimental_ui,
+            ui_mode,
             api_auth,
             analytics_sender: None,
             entrypoint_packages: None,
@@ -373,7 +377,7 @@ impl RunBuilder {
             &self.opts.runcache_opts,
             color_selector,
             daemon.clone(),
-            self.ui,
+            self.color_config,
             self.opts.run_opts.dry_run.is_some(),
         ));
 
@@ -383,8 +387,8 @@ impl RunBuilder {
 
         Ok(Run {
             version: self.version,
-            ui: self.ui,
-            experimental_ui: self.experimental_ui,
+            color_config: self.color_config,
+            ui_mode: self.ui_mode,
             start_at,
             processes: self.processes,
             run_telemetry,
@@ -439,11 +443,7 @@ impl RunBuilder {
 
         if !self.opts.run_opts.parallel {
             engine
-                .validate(
-                    pkg_dep_graph,
-                    self.opts.run_opts.concurrency,
-                    self.experimental_ui,
-                )
+                .validate(pkg_dep_graph, self.opts.run_opts.concurrency, self.ui_mode)
                 .map_err(Error::EngineValidation)?;
         }
 
