@@ -137,7 +137,7 @@ impl std::fmt::Debug for APIAuth {
 pub fn is_linked(api_auth: &Option<APIAuth>) -> bool {
     api_auth
         .as_ref()
-        .map_or(false, |api_auth| api_auth.is_linked())
+        .is_some_and(|api_auth| api_auth.is_linked())
 }
 
 impl Client for APIClient {
@@ -626,6 +626,10 @@ impl APIClient {
 
     pub fn base_url(&self) -> &str {
         self.base_url.as_str()
+    }
+
+    pub fn with_base_url(&mut self, base_url: String) {
+        self.base_url = base_url;
     }
 
     async fn do_preflight(
